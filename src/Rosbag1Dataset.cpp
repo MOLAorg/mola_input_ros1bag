@@ -237,28 +237,45 @@ mrpt::img::CImage imageFromROS(const sensor_msgs::Image& image)
 }
 
 /** Manual conversion sensor_msgs/CameraInfo -> mrpt::img::TCamera. Unknown
- *  distortion models are left as DistortionModel::none (a throttled warning
- *  is logged by the caller) rather than guessing a wrong one. */
-mrpt::img::TCamera cameraInfoFromROS(const sensor_msgs::CameraInfo& info)
+ *  distortion models are left as DistortionModel::none rather than guessing a
+ *  wrong one, and set `recognized` to false so the caller can warn: silently
+ *  dropping a real distortion is far more damaging than an unhandled model,
+ *  since every feature is then mislocated by a fixed, purely radial amount that
+ *  no amount of outlier rejection can catch.
+ *
+ *  Model names are not standardized across calibration toolchains, so the
+ *  common aliases are accepted for each of the two supported families. */
+mrpt::img::TCamera cameraInfoFromROS(const sensor_msgs::CameraInfo& info, bool& recognized)
 {
   mrpt::img::TCamera cam;
   cam.ncols = info.width;
   cam.nrows = info.height;
   cam.setIntrinsicParamsFromValues(info.K[0], info.K[4], info.K[2], info.K[5]);
 
+  recognized = true;
+
   const std::vector<double>& d = info.D;
-  if (info.distortion_model == "plumb_bob")
+  if (info.distortion_model == "plumb_bob" || info.distortion_model == "radtan" ||
+      info.distortion_model == "rational_polynomial")
   {
     cam.setDistortionPlumbBob(
         d.size() > 0 ? d[0] : 0.0, d.size() > 1 ? d[1] : 0.0, d.size() > 2 ? d[2] : 0.0,
         d.size() > 3 ? d[3] : 0.0, d.size() > 4 ? d[4] : 0.0);
   }
-  else if (info.distortion_model == "equidistant" || info.distortion_model == "fisheye" ||
-           info.distortion_model == "kannala_brandt")
+  else if (
+      info.distortion_model == "equidistant" || info.distortion_model == "fisheye" ||
+      info.distortion_model == "kannala_brandt")
   {
     cam.setDistortionKannalaBrandt(
         d.size() > 0 ? d[0] : 0.0, d.size() > 1 ? d[1] : 0.0, d.size() > 2 ? d[2] : 0.0,
         d.size() > 3 ? d[3] : 0.0);
+  }
+  else
+  {
+    // An empty model with no coefficients is a legitimate way to say "already
+    // undistorted"; anything else means real distortion is being discarded.
+    const bool hasCoefficients = std::any_of(d.begin(), d.end(), [](double v) { return v != 0.0; });
+    recognized                 = !hasCoefficients;
   }
   return cam;
 }
@@ -686,11 +703,20 @@ void Rosbag1Dataset::initialize_rds(const Yaml& c)
         {
           if (const auto info = it->instantiate<sensor_msgs::CameraInfo>(); info)
           {
-            fixedCameraParams = cameraInfoFromROS(*info);
+            bool modelRecognized = true;
+            fixedCameraParams    = cameraInfoFromROS(*info, modelRecognized);
             MRPT_LOG_INFO_FMT(
                 "- '%s': camera intrinsics from '%s' (%ux%u, fx=%.2f, fy=%.2f)",
                 sensorLabel.c_str(), infoTopic->c_str(), fixedCameraParams->ncols,
                 fixedCameraParams->nrows, fixedCameraParams->fx(), fixedCameraParams->fy());
+            if (!modelRecognized)
+            {
+              MRPT_LOG_WARN_FMT(
+                  "- '%s': unsupported distortion_model '%s' with non-zero coefficients; the "
+                  "images will be treated as undistorted, which silently biases every feature "
+                  "position.",
+                  sensorLabel.c_str(), info->distortion_model.c_str());
+            }
           }
         }
       }
@@ -707,22 +733,19 @@ void Rosbag1Dataset::initialize_rds(const Yaml& c)
       const std::string rosType = topic2type.count(topic) ? topic2type.at(topic) : "";
       if (rosType == "sensor_msgs/CompressedImage")
       {
-        auto callback =
-            [this, sensorLabel, fixedSensorPose, fixedCameraParams](
-                const rosbag::MessageInstance& m)
+        auto callback = [this, sensorLabel, fixedSensorPose,
+                         fixedCameraParams](const rosbag::MessageInstance& m)
         {
           return catchExceptions(
-              [this, sensorLabel, m, fixedSensorPose, fixedCameraParams]() {
-                return toCompressedImage(sensorLabel, m, fixedSensorPose, fixedCameraParams);
-              });
+              [this, sensorLabel, m, fixedSensorPose, fixedCameraParams]()
+              { return toCompressedImage(sensorLabel, m, fixedSensorPose, fixedCameraParams); });
         };
         lookup_[topic].emplace_back(callback);
       }
       else
       {
-        auto callback =
-            [this, sensorLabel, fixedSensorPose, fixedCameraParams](
-                const rosbag::MessageInstance& m)
+        auto callback = [this, sensorLabel, fixedSensorPose,
+                         fixedCameraParams](const rosbag::MessageInstance& m)
         {
           return catchExceptions(
               [this, sensorLabel, m, fixedSensorPose, fixedCameraParams]()
